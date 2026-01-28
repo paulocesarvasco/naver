@@ -17,4 +17,5 @@ export const env = {
   PROXY_ADDRESS: required('PROXY_ADDRESS'),
   PROXY_USER: required('PROXY_USER'),
   PROXY_PASS: required('PROXY_PASS'),
+  WORKERS: Number(required('WORKERS')),
 };

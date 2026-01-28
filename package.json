@@ -5,7 +5,7 @@
 	"scripts": {
 		"dev": "tsx src/service.js",
 		"build": "tsc -p tsconfig.json",
-		"start": "node dist/server.js"
+		"start": "node dist/src/app.js"
 	},
 	"dependencies": {
 		"dotenv": "^17.2.3",
