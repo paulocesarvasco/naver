@@ -1,4 +1,4 @@
-import { generateSessionID } from './helpers/id-generator';
+import { generateSessionID } from './id';
 
 const DEFAULT_DOMAIN = '.naver.com';
 const DEFAULT_PATH = '/';
