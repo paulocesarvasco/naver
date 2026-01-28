@@ -1,24 +1,33 @@
-import Fastify, { type FastifyInstance } from "fastify";
-import { healthRoutes } from "./routes/health.js";
+import { newServer } from './server.js';
 
+const port = 3000;
+const host = '0.0.0.0';
 
-export function buildApp(): FastifyInstance {
-  const app = Fastify({
-    logger: true
-  });
+const server = newServer();
 
-  app.register(healthRoutes, { prefix: "/health" });
-
-  app.setErrorHandler((err, _req, reply) => {
-    app.log.error(err);
-
-    const statusCode = typeof (err as any).statusCode === "number" ? (err as any).statusCode : 500;
-
-    reply.code(statusCode).send({
-      error: statusCode === 500 ? "internal_error" : "request_error",
-      message: err.message
-    });
-  });
-
-  return app;
+async function start() {
+  try {
+    await server.listen({ port, host });
+  } catch (err) {
+    server.log.error(err, 'failed to start server');
+    process.exit(1);
+  }
 }
+
+async function shutdown(signal: string) {
+  server.log.info({ signal }, 'received shutdown signal');
+
+  try {
+    await server.close();
+    server.log.info('server closed gracefully');
+    process.exit(0);
+  } catch (err) {
+    server.log.error(err, 'error during shutdown');
+    process.exit(1);
+  }
+}
+
+process.on('SIGTERM', shutdown);
+process.on('SIGINT', shutdown);
+
+start();
