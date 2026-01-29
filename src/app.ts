@@ -1,13 +1,11 @@
 import { newServer } from './server.js';
-
-const port = 3000;
-const host = '0.0.0.0';
+import { env } from './config/env.js';
 
 const server = newServer();
 
 async function start() {
   try {
-    await server.listen({ port, host });
+    await server.listen({ port: env.SERVER_PORT, host: env.SERVER_HOST });
   } catch (err) {
     server.log.error(err, 'failed to start server');
     process.exit(1);
