@@ -3,6 +3,7 @@ import { createOEPConfigCookie, createSessionCookie } from './helpers/cookies.js
 import { env } from './config/env.js';
 import { extractScanParameters, replaceScanParameters } from './helpers/url.js';
 import EventEmitter from 'events';
+import { RedisClient } from './database/client.js';
 
 const referer =
   'https://search.shopping.naver.com/ns/search?query=iphone&includedDeliveryFee=true&score=4.8%7C5';
@@ -21,6 +22,8 @@ export class Crawler extends EventEmitter {
   private pageSize!: number;
   private targetUrl!: string;
   private step!: number;
+  private requestID!: string;
+  private database!: RedisClient;
 
   constructor(
     private readonly options: {
@@ -32,11 +35,15 @@ export class Crawler extends EventEmitter {
       locale?: string;
       userAgent?: string;
       headless?: boolean;
-      step?: number;
+      step: number;
+      requestID: string;
     },
   ) {
     super();
-    this.step = options.step ? options.step : 1;
+    this.step = options.step;
+    this.requestID = options.requestID;
+
+    this.database = new RedisClient();
   }
 
   async init() {
@@ -49,21 +56,21 @@ export class Crawler extends EventEmitter {
       locale: this.options.locale ?? 'ko-KR',
       userAgent: this.options.userAgent,
     });
+
+    await this.database.connect();
   }
 
   private attachListeners(page: Page) {
-    page.on('request', (req) => {
-      if (req.resourceType() === 'document') {
-        // console.log(`[${name}] [DOCUMENT REQUEST] [${req.url()}]`);
-        // console.log('DOCUMENT REQUEST: ', req.url());
-        // console.log('Headers:', req.headers());
-      }
-    });
+    //   page.on('request', (req) => {
+    //     if (req.resourceType() === 'document') {
+    //       // console.log(`[${name}] [DOCUMENT REQUEST] [${req.url()}]`);
+    //       // console.log('DOCUMENT REQUEST: ', req.url());
+    //       // console.log('Headers:', req.headers());
+    //     }
+    //   });
 
     page.on('response', async (res) => {
       if (res.request().resourceType() !== 'document') return;
-
-      // console.log('DOCUMENT RESPONSE: ', res.status());
 
       if (res.status() != 200 && res.status() != 407) {
         process.exit(1);
@@ -80,10 +87,12 @@ export class Crawler extends EventEmitter {
 
         await res.finished();
 
-        console.log('-'.repeat(40));
-        console.log(`[${name}] [DOCUMENT REQUEST] [${res.request().url()}]`);
-        console.log(`[${name}] [DOCUMENT RESPONSE] [${res.status()}]`);
-        console.log('-'.repeat(40));
+        await this.database.save(this.requestID, prod.data.data);
+
+        // console.log('-'.repeat(40));
+        // console.log(`[${name}] [DOCUMENT REQUEST] [${res.request().url()}]`);
+        // console.log(`[${name}] [DOCUMENT RESPONSE] [${res.status()}]`);
+        // console.log('-'.repeat(40));
         this.emit('next_request');
       } else {
         await this.close();
@@ -134,9 +143,7 @@ export class Crawler extends EventEmitter {
   async close() {
     await this.context.close();
     await this.browser.close();
-
-    // const elapsed = performance.now() - start;
-    // console.log(`Elapsed time: ${elapsed} ms`);
+    await this.database.disconnect();
   }
 }
 
@@ -144,6 +151,7 @@ const args = process.argv;
 const name = args[2];
 const targetUrl = args[3];
 const step = Number(args[4]);
+const id = args[5];
 
 const session = new Crawler({
   headless: true,
@@ -153,6 +161,7 @@ const session = new Crawler({
     password: env.PROXY_PASS,
   },
   step: step,
+  requestID: id,
 });
 
 session.on('next_request', async () => {
