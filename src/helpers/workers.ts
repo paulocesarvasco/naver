@@ -8,9 +8,13 @@ export function initWorker(
   id: string,
 ): ChildProcess {
   const absoluteScriptPath = path.resolve(new URL('../crawler.js', import.meta.url).pathname);
-  const worker = fork(absoluteScriptPath, [workerName, targetUrl, step, id], {
+  const worker = fork(absoluteScriptPath, [targetUrl, step, id], {
     cwd: process.cwd(),
     stdio: ['inherit', 'inherit', 'inherit', 'ipc'],
+    env: {
+      ...process.env,
+      WORKER_ID: workerName,
+    },
   });
 
   return worker;

@@ -4,6 +4,11 @@ import { env } from './config/env.js';
 import { extractScanParameters, replaceScanParameters } from './helpers/url.js';
 import EventEmitter from 'events';
 import { RedisClient } from './database/client.js';
+import { createLogger } from './log/logger.js';
+
+const log = createLogger();
+
+log.info('worker started');
 
 const referer =
   'https://search.shopping.naver.com/ns/search?query=iphone&includedDeliveryFee=true&score=4.8%7C5';
@@ -52,27 +57,42 @@ export class Crawler extends EventEmitter {
       proxy: this.options.proxy,
     });
 
+    this.browser.on('disconnected', () => log.error('browser disconnected'));
+    await this.initContext();
+    await this.database.connect();
+  }
+
+  async initContext() {
+    if (!this.browser.isConnected()) {
+      throw new Error('browser is not connected');
+    }
+
+    if (this.context) {
+      try {
+        await this.context.close();
+      } catch (err) {
+        log.warn({ err }, 'failed to close previous context');
+      }
+    }
+
     this.context = await this.browser.newContext({
       locale: this.options.locale ?? 'ko-KR',
       userAgent: this.options.userAgent,
     });
 
-    await this.database.connect();
+    this.context.on('close', () => {
+      log.info('context closed');
+    });
   }
 
   private attachListeners(page: Page) {
-    //   page.on('request', (req) => {
-    //     if (req.resourceType() === 'document') {
-    //       // console.log(`[${name}] [DOCUMENT REQUEST] [${req.url()}]`);
-    //       // console.log('DOCUMENT REQUEST: ', req.url());
-    //       // console.log('Headers:', req.headers());
-    //     }
-    //   });
-
     page.on('response', async (res) => {
+      await res.finished();
+
       if (res.request().resourceType() !== 'document') return;
 
       if (res.status() != 200 && res.status() != 407) {
+        log.error({ request: res.request().url(), response: res.status() });
         process.exit(1);
       }
 
@@ -85,27 +105,38 @@ export class Crawler extends EventEmitter {
         this.cursor += this.pageSize * this.step;
         this.listPage += this.step;
 
-        await res.finished();
-
         await this.database.save(this.requestID, prod.data.data);
 
-        // console.log('-'.repeat(40));
-        // console.log(`[${name}] [DOCUMENT REQUEST] [${res.request().url()}]`);
-        // console.log(`[${name}] [DOCUMENT RESPONSE] [${res.status()}]`);
-        // console.log('-'.repeat(40));
+        log.debug({
+          request: res.request().url(),
+          response: res.status(),
+          responseTime: res.request().timing().responseEnd - res.request().timing().requestStart,
+        });
+
         this.emit('next_request');
       } else {
+        log.info({ method: 'response', request: res.request().url(), body: prod });
         await this.close();
       }
     });
   }
 
   async setCookies() {
-    await this.context.addCookies([createSessionCookie(), createOEPConfigCookie()]);
+    try {
+      await this.context.addCookies([createSessionCookie(), createOEPConfigCookie()]);
+    } catch (err) {
+      log.error({ method: 'set cookies', request: this.targetUrl, error: err });
+      this.emit('reset_proxy');
+    }
   }
 
   async clearCookies() {
-    await this.context.clearCookies();
+    try {
+      await this.context.clearCookies();
+    } catch (err) {
+      log.error({ method: 'clear cookies', request: this.targetUrl, error: err });
+      this.emit('reset_proxy');
+    }
   }
 
   setScanParameters(url: string) {
@@ -125,18 +156,26 @@ export class Crawler extends EventEmitter {
     );
   }
 
-  async goto(referer?: string) {
+  async goto() {
+    const page = await this.context.newPage();
+    this.attachListeners(page);
     try {
-      const page = await this.context.newPage();
-      this.attachListeners(page);
       await page.goto(this.targetUrl, {
         referer,
         waitUntil: 'domcontentloaded',
       });
       await page.close();
     } catch (err) {
-      console.log(err);
-      this.emit('reset_proxy');
+      const error = err as Error;
+      log.error({ method: 'goto', request: this.targetUrl, error: err, message: error.message });
+
+      const isClosed = /Target page, context or browser has been closed/.test(error.message);
+      if (!isClosed) {
+        this.emit('next_request');
+        return;
+      }
+
+      await page.close();
     }
   }
 
@@ -148,10 +187,9 @@ export class Crawler extends EventEmitter {
 }
 
 const args = process.argv;
-const name = args[2];
-const targetUrl = args[3];
-const step = Number(args[4]);
-const id = args[5];
+const targetUrl = args[2];
+const step = Number(args[3]);
+const id = args[4];
 
 const session = new Crawler({
   headless: true,
@@ -165,21 +203,18 @@ const session = new Crawler({
 });
 
 session.on('next_request', async () => {
-  // await delay(100, 2000);
   await session.clearCookies();
   await session.setCookies();
   session.updateScanParameters();
-  await session.goto(referer);
+  await session.goto();
 });
 
-session.on('reset_proxy', () => {
-  session.init();
+session.on('reset_proxy', async () => {
+  await session.initContext();
   session.emit('next_request');
 });
-
-// const start = performance.now();
 
 await session.init();
 await session.setCookies();
 session.setScanParameters(targetUrl);
-await session.goto(referer);
+await session.goto();

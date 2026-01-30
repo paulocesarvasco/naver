@@ -1,5 +1,6 @@
 import Fastify, { type FastifyInstance } from 'fastify';
-import { healthRoutes, scan } from './routes/health.js';
+import { healthRoutes } from './routes/health.js';
+import { scan } from './routes/scan.js';
 
 export function newServer(): FastifyInstance {
   const server = Fastify({
@@ -7,7 +8,7 @@ export function newServer(): FastifyInstance {
   });
 
   server.register(healthRoutes, { prefix: '/health' });
-  server.register(scan, { prefix: '/scan' });
+  server.register(scan);
 
   server.setErrorHandler((err, _req, reply) => {
     server.log.error(err);
