@@ -24,7 +24,7 @@ export class RedisClient {
     });
 
     this.client.on('reconnecting', () => {
-      log.warn('database reconnecting...');
+      log.warn('database reconnecting');
     });
 
     this.client.on('end', () => {
@@ -32,7 +32,7 @@ export class RedisClient {
     });
 
     this.client.on('error', (err) => {
-      log.error('database error:', err);
+      log.error('database error', err);
     });
   }
 
