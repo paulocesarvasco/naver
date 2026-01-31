@@ -1,8 +1,7 @@
 import pino from 'pino';
 
 export function createLogger(bindings = {}) {
-  // LOG_LEVEL=info|debug|warn|error
-  const level = process.env.LOG_LEVEL || 'info';
+  const level = process.env.LOG_LEVEL || 'error';
 
   return pino({
     level,

@@ -1,6 +1,7 @@
 import type { FastifyPluginAsync } from 'fastify';
 import service from '../service.js';
 import { waitForEvent } from '../helpers/events.js';
+import requestQueue from '../helpers/queue.js';
 
 export const scan: FastifyPluginAsync = async (app) => {
   app.route({
@@ -25,10 +26,14 @@ export const scan: FastifyPluginAsync = async (app) => {
     handler: async (request, reply) => {
       const { url } = request.query as { url: string };
       try {
-        service.scanAllPages(url, crypto.randomUUID());
+        const requestID = crypto.randomUUID();
 
-        const results = await waitForEvent<any>(service, 'scan_finish');
-        return results;
+        const response = waitForEvent<{ requestID: string; result: any }>(service, 'scan_finish', {
+          filter: (payload) => payload.requestID === requestID,
+        });
+
+        service.scanAllPages(url, requestID);
+        return await response;
       } catch (err) {
         request.log.error({ err, url }, 'scan failed');
         return reply.code(500).send({ error: 'scan_failed' });
@@ -57,19 +62,25 @@ export const nave: FastifyPluginAsync = async (app) => {
         },
       },
     },
-    preHandler: async (request, reply) => {
-      if (!service.isAvailable()) {
-        return reply.code(422).send({ error: 'too_many_requests' });
-      }
-    },
+    // preHandler: async (request, reply) => {
+    //   if (!service.isAvailable()) {
+    //     return reply.code(422).send({ error: 'too_many_requests' });
+    //   }
+    // },
     handler: async (request, reply) => {
       const { url } = request.query as { url: string };
 
       try {
-        service.scanSinglePage(url, crypto.randomUUID());
+        const result = await requestQueue.push(async () => {
+          const requestID = crypto.randomUUID();
+          const response = waitForEvent<ResponsePayload>(service, 'scan_finish', {
+            filter: (payload) => payload.requestID === requestID,
+          });
+          service.scanSinglePage(url, requestID);
+          return await response;
+        });
 
-        const results = await waitForEvent<any>(service, 'scan_finish');
-        return results;
+        return result.result;
       } catch (err) {
         request.log.error({ err, url }, 'scan failed');
         return reply.code(500).send({ error: 'scan_failed' });

@@ -49,14 +49,23 @@ export class Crawler extends EventEmitter {
   }
 
   async init() {
-    this.browser = await firefox.launch({
-      headless: this.options.headless ?? true,
-      proxy: this.options.proxy,
-    });
+    try {
+      this.browser = await firefox.launch({
+        headless: this.options.headless ?? true,
+        proxy: this.options.proxy,
+        env: {
+          ...process.env,
+          MOZ_REMOTE_SETTINGS_DEVTOOLS: '1',
+        },
+      });
 
-    this.browser.on('disconnected', () => log.error('browser disconnected'));
-    await this.initContext();
-    await this.database.connect();
+      this.browser.on('disconnected', () => log.info('browser disconnected'));
+      while (!this.browser.isConnected()) {}
+      await this.initContext();
+      await this.database.connect();
+    } catch (err) {
+      log.error({ msg: 'crawler init failed', error: err });
+    }
   }
 
   async initContext() {
@@ -72,17 +81,21 @@ export class Crawler extends EventEmitter {
       }
     }
 
-    this.context = await this.browser.newContext({
-      locale: this.options.locale ?? 'ko-KR',
-      userAgent: this.options.userAgent,
-    });
+    try {
+      this.context = await this.browser.newContext({
+        locale: this.options.locale ?? 'ko-KR',
+        userAgent: this.options.userAgent,
+      });
 
-    this.context.on('close', () => {
-      log.info('context closed');
-      this.hasActiveContext = false;
-    });
+      this.context.on('close', () => {
+        log.info('context closed');
+        this.hasActiveContext = false;
+      });
 
-    this.hasActiveContext = true;
+      this.hasActiveContext = true;
+    } catch (err) {
+      log.error({ msg: 'failed to close previous context', error: err });
+    }
   }
 
   private attachListeners(page: Page) {
@@ -93,36 +106,40 @@ export class Crawler extends EventEmitter {
     });
 
     page.on('response', async (res) => {
-      await res.finished();
+      try {
+        await res.finished();
 
-      if (res.request().resourceType() !== 'document') return;
+        if (res.request().resourceType() !== 'document') return;
 
-      if (res.status() != 200 && res.status() != 407) {
-        log.error({ request: res.request().url(), response: res.status() });
-        process.exit(1);
-      }
+        if (res.status() != 200 && res.status() != 407) {
+          log.error({ request: res.request().url(), response: res.status() });
+          process.exit(1); //TODO: improve handling detection
+        }
 
-      const headers = res.headers();
+        const headers = res.headers();
 
-      if (!headers['content-type']?.includes('application/json')) return;
+        if (!headers['content-type']?.includes('application/json')) return;
 
-      const prod = await res.json();
-      if (prod.data.hasMore) {
-        this.cursor += this.pageSize * this.step;
-        this.listPage += this.step;
+        const prod = await res.json();
+        if (prod.data.hasMore) {
+          this.cursor += this.pageSize * this.step;
+          this.listPage += this.step;
 
-        await this.database.save(this.requestID, prod.data.data);
+          await this.database.save(this.requestID, prod.data.data);
 
-        log.debug({
-          request: res.request().url(),
-          response: res.status(),
-          responseTime: res.request().timing().responseEnd - res.request().timing().requestStart,
-        });
+          log.debug({
+            request: res.request().url(),
+            response: res.status(),
+            responseTime: res.request().timing().responseEnd - res.request().timing().requestStart,
+          });
 
-        this.isBatchMode ? this.emit('next_request') : await this.close();
-      } else {
-        log.info({ method: 'response', request: res.request().url(), body: prod });
-        await this.close();
+          this.isBatchMode ? this.emit('next_request') : await this.requestFinished();
+        } else {
+          this.requestFinished();
+          log.debug({ method: 'response', request: res.request().url(), body: prod });
+        }
+      } catch (err) {
+        log.error({ msg: 'unexpected error handling page response', error: err });
       }
     });
   }
@@ -171,9 +188,9 @@ export class Crawler extends EventEmitter {
       log.warn({ method: 'goto', request: this.targetUrl, message: 'context not active' });
       return;
     }
-    const page = await this.context.newPage();
-    this.attachListeners(page);
     try {
+      const page = await this.context.newPage();
+      this.attachListeners(page);
       await page.goto(this.targetUrl, {
         referer,
         waitUntil: 'domcontentloaded',
@@ -183,26 +200,31 @@ export class Crawler extends EventEmitter {
       const error = err as Error;
       log.error({ method: 'goto', request: this.targetUrl, error: err, message: error.message });
 
-      if (!page.isClosed()) await page.close();
-
       const isClosed = /Target page, context or browser has been closed/.test(error.message);
       if (!isClosed) {
         this.emit('next_request');
-        return;
       }
     }
   }
 
-  async close() {
-    // await this.context.close();
-    // await this.browser.close();
-    // await this.database.disconnect();
+  private requestFinished() {
     const res: WorkerResponseMessage = {
       type: 'scan_finish',
       request_id: this.requestID,
       worker_name: process.env.WORKER_ID || '',
     };
     process.send?.(res);
+  }
+
+  async terminate() {
+    try {
+      await this.browser.close();
+      await delay(200);
+      await this.database.disconnect();
+    } catch (err) {
+      const error = err as Error;
+      log.error({ msg: 'unexpected error terminating crawler', error: error.message });
+    }
   }
 }
 
@@ -214,21 +236,15 @@ process.on('message', async (msg: WorkerRequestMessage) => {
       const requestID = msg.request_id;
       const isBatchMode = msg.batch;
 
-      // await crawler.initContext();
-      await crawler.setCookies();
-      crawler.setScanParameters(targetUrl, step, requestID, isBatchMode);
-      await crawler.goto();
+      try {
+        // await crawler.initContext();
+        await crawler.setCookies();
+        crawler.setScanParameters(targetUrl, step, requestID, isBatchMode);
+        await crawler.goto();
+      } catch (err) {
+        log.error({ msg: 'unexpected error starting scan', error: err });
+      }
   }
-});
-
-process.on('uncaughtException', (err, origin) => {
-  log.error({ '🔥 Uncaught Exception': err });
-  log.error({ 'Origin:': origin });
-
-  // DO cleanup here
-  // close playwright, workers, db, etc.
-
-  process.exit(1); // recommended
 });
 
 const crawler = new Crawler({
@@ -241,15 +257,38 @@ const crawler = new Crawler({
 });
 
 crawler.on('next_request', async () => {
-  await crawler.clearCookies();
-  await crawler.setCookies();
-  crawler.updateScanParameters();
-  await crawler.goto();
+  try {
+    await crawler.clearCookies();
+    await crawler.setCookies();
+    crawler.updateScanParameters();
+    await crawler.goto();
+  } catch (err) {
+    log.error({ msg: 'unexpected error processing next request', error: err });
+  }
 });
 
 crawler.on('reset_context', async () => {
-  await crawler.initContext();
-  crawler.emit('next_request');
+  try {
+    await crawler.initContext();
+    crawler.emit('next_request');
+  } catch (err) {
+    log.error({ msg: 'unexpected error to reset context', error: err });
+  }
 });
 
-await crawler.init();
+process.on('uncaughtException', (err, origin) => {
+  log.error({ 'Uncaught Exception': err });
+  log.error({ 'Origin:': origin });
+  process.exit(10);
+});
+
+process.on('SIGTERM', async () => {
+  await crawler.terminate();
+  process.exit(0);
+});
+
+try {
+  crawler.init();
+} catch (err) {
+  log.error({ msg: 'unexpected error booting crawler', error: err });
+}

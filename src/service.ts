@@ -31,14 +31,17 @@ class Service extends EventEmitter {
 
       const worker = initWorker(name);
 
-      worker.once('exit', (code, signal) => {
+      worker.on('exit', (code, signal) => {
         // TODO: handle exit abnormal processes
         log.warn({ 'worker finished': name, code: code });
-        this.busyWorkers.delete(name);
       });
 
+      worker.on('error', (err) => log.error(err));
+
       worker.on('message', (msg: WorkerResponseMessage) => {
-        this.idleWorkers.set(msg.worker_name, worker);
+        const w = this.busyWorkers.get(msg.worker_name);
+        if (!w) return;
+        this.idleWorkers.set(msg.worker_name, w);
         this.busyWorkers.delete(msg.worker_name);
         switch (msg.type) {
           case 'scan_finish':
@@ -46,11 +49,14 @@ class Service extends EventEmitter {
             if (!request) return;
             request--;
             if (request == 0) {
-              this.emit('scan_finish', this.database.read(msg.request_id));
+              this.emit('scan_finish', {
+                requestID: msg.request_id,
+                result: this.database.read(msg.request_id),
+              });
               this.ongoing.delete(msg.request_id);
-              break;
+            } else {
+              this.ongoing.set(msg.request_id, request);
             }
-            this.ongoing.set(msg.request_id, request);
             break;
           case 'scan_error':
             // TODO: handle error cases
@@ -118,6 +124,18 @@ class Service extends EventEmitter {
 
   isAvailable(): boolean {
     return this.idleWorkers.size > 0;
+  }
+
+  async shutdown() {
+    for (const [name, worker] of this.idleWorkers) {
+      worker.kill();
+      this.idleWorkers.delete(name);
+    }
+    for (const [name, worker] of this.busyWorkers) {
+      worker.kill();
+      this.idleWorkers.delete(name);
+    }
+    await this.database.disconnect();
   }
 }
 

@@ -3,9 +3,9 @@
 	"private": true,
 	"type": "module",
 	"scripts": {
-		"dev": "tsx src/service.js",
+		"dev": "tsx index.ts",
 		"build": "tsc -p tsconfig.json",
-		"start": "node dist/src/app.js"
+		"start": "npm dist/index.js"
 	},
 	"dependencies": {
 		"dotenv": "^17.2.3",
