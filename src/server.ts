@@ -5,6 +5,7 @@ import { scan, nave } from './routes/scan.js';
 export function newServer(): FastifyInstance {
   const server = Fastify({
     logger: true,
+    forceCloseConnections: true,
   });
 
   server.register(healthRoutes, { prefix: '/health' });

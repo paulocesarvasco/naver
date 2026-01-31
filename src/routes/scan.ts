@@ -2,6 +2,7 @@ import type { FastifyPluginAsync } from 'fastify';
 import service from '../service.js';
 import { waitForEvent } from '../helpers/events.js';
 import requestQueue from '../helpers/queue.js';
+import { type ResponsePayload } from '../helpers/types.js';
 
 export const scan: FastifyPluginAsync = async (app) => {
   app.route({
@@ -28,12 +29,12 @@ export const scan: FastifyPluginAsync = async (app) => {
       try {
         const requestID = crypto.randomUUID();
 
-        const response = waitForEvent<{ requestID: string; result: any }>(service, 'scan_finish', {
+        const response = waitForEvent<ResponsePayload>(service, 'scan_finish', {
           filter: (payload) => payload.requestID === requestID,
         });
 
         service.scanAllPages(url, requestID);
-        return await response;
+        return (await response).result;
       } catch (err) {
         request.log.error({ err, url }, 'scan failed');
         return reply.code(500).send({ error: 'scan_failed' });

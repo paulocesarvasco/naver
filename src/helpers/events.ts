@@ -17,12 +17,20 @@ export function waitForEvent<T>(
   return new Promise((resolve, reject) => {
     const onEvent = (value: T) => {
       if (!opts.filter(value)) return;
+      cleanup();
       resolve(value);
     };
 
-    const onError = (err: unknown) => {
+    const onError = (value: T, err: unknown) => {
+      if (!opts.filter(value)) return;
+      cleanup();
       reject(err);
     };
+
+    function cleanup() {
+      emitter.removeListener(event, onEvent);
+      emitter.removeListener('error', onError);
+    }
 
     emitter.on(event, onEvent);
     emitter.on('error', onError);

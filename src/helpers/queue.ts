@@ -1,4 +1,6 @@
 import { env } from '../config/env.js';
+import service from '../service.js';
+import { type ResponsePayload } from './types.js';
 
 type Task<T> = {
   run: () => Promise<T>;
@@ -22,7 +24,11 @@ export class AwaitQueue<T> {
   }
 
   private pump() {
-    while (this.running < env.WORKERS && this.q.length > 0) {
+    while (
+      this.running <= service.operationalWorks() &&
+      service.isAvailable() &&
+      this.q.length > 0
+    ) {
       const t = this.q.shift()!;
       this.running++;
 

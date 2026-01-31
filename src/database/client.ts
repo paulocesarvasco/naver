@@ -32,7 +32,8 @@ export class RedisClient {
     });
 
     this.client.on('error', (err) => {
-      log.error('database error', err);
+      const error = err as Error;
+      log.error({ msg: 'database error', err: error.message });
     });
   }
 
@@ -51,17 +52,21 @@ export class RedisClient {
     this.connected = false;
   }
 
-  async save(streamKey: string, data: unknown): Promise<string> {
-    return this.client.xAdd(streamKey, '*', { json: JSON.stringify(data) });
+  async save(key: string, data: unknown): Promise<string> {
+    return this.client.xAdd(key, '*', { json: JSON.stringify(data) });
   }
 
-  async read(streamKey: string): Promise<Object[]> {
-    const entries = await this.client.xRange(streamKey, '-', '+');
+  async read(key: string): Promise<Object[]> {
+    const entries = await this.client.xRange(key, '-', '+');
 
     return entries
       .map((e) => {
         return JSON.parse(e.message.json);
       })
       .flat();
+  }
+
+  async delete(key: string): Promise<number> {
+    return this.client.del(key);
   }
 }

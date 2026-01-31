@@ -1,14 +1,16 @@
-import { firefox, Browser, BrowserContext, Page } from 'playwright';
+import { firefox, Browser, BrowserContext, Response, errors } from 'playwright';
 import { createOEPConfigCookie, createSessionCookie } from './helpers/cookies.js';
 import { env } from './config/env.js';
 import { extractScanParameters, replaceScanParameters } from './helpers/url.js';
 import EventEmitter from 'events';
 import { RedisClient } from './database/client.js';
 import { createLogger } from './log/logger.js';
-import { WorkerRequestMessage, WorkerResponseMessage } from './helpers/workers.js';
+import { WorkerRequestMessage, WorkerResponseMessage } from './helpers/types.js';
+import { PageResponse } from './helpers/types.js';
 
 const log = createLogger();
-log.info('worker started');
+
+const MAX_RETRIES = 3;
 
 const referer =
   'https://search.shopping.naver.com/ns/search?query=iphone&includedDeliveryFee=true&score=4.8%7C5';
@@ -30,7 +32,7 @@ export class Crawler extends EventEmitter {
   private requestID!: string;
   private database!: RedisClient;
   private isBatchMode!: boolean;
-  private hasActiveContext!: boolean;
+  private retryCount!: number;
 
   constructor(
     private readonly options: {
@@ -53,18 +55,21 @@ export class Crawler extends EventEmitter {
       this.browser = await firefox.launch({
         headless: this.options.headless ?? true,
         proxy: this.options.proxy,
-        env: {
-          ...process.env,
-          MOZ_REMOTE_SETTINGS_DEVTOOLS: '1',
-        },
       });
 
       this.browser.on('disconnected', () => log.info('browser disconnected'));
-      while (!this.browser.isConnected()) {}
       await this.initContext();
       await this.database.connect();
+
+      const page = await this.context.newPage();
+      await page.goto(referer, {
+        waitUntil: 'commit',
+      });
+      await page.close();
+      this.workerStarted();
     } catch (err) {
       log.error({ msg: 'crawler init failed', error: err });
+      process.exit(1);
     }
   }
 
@@ -89,75 +94,19 @@ export class Crawler extends EventEmitter {
 
       this.context.on('close', () => {
         log.info('context closed');
-        this.hasActiveContext = false;
       });
-
-      this.hasActiveContext = true;
     } catch (err) {
       log.error({ msg: 'failed to close previous context', error: err });
     }
   }
 
-  private attachListeners(page: Page) {
-    page.on('close', () => log.info('page close'));
-
-    page.on('pageerror', (err) => {
-      log.error(`Page Error: ${err.message}`);
-    });
-
-    page.on('response', async (res) => {
-      try {
-        await res.finished();
-
-        if (res.request().resourceType() !== 'document') return;
-
-        if (res.status() != 200 && res.status() != 407) {
-          log.error({ request: res.request().url(), response: res.status() });
-          process.exit(1); //TODO: improve handling detection
-        }
-
-        const headers = res.headers();
-
-        if (!headers['content-type']?.includes('application/json')) return;
-
-        const prod = await res.json();
-        if (prod.data.hasMore) {
-          this.cursor += this.pageSize * this.step;
-          this.listPage += this.step;
-
-          await this.database.save(this.requestID, prod.data.data);
-
-          log.debug({
-            request: res.request().url(),
-            response: res.status(),
-            responseTime: res.request().timing().responseEnd - res.request().timing().requestStart,
-          });
-
-          this.isBatchMode ? this.emit('next_request') : await this.requestFinished();
-        } else {
-          this.requestFinished();
-          log.debug({ method: 'response', request: res.request().url(), body: prod });
-        }
-      } catch (err) {
-        log.error({ msg: 'unexpected error handling page response', error: err });
-      }
-    });
-  }
-
-  async setCookies() {
-    try {
-      await this.context.addCookies([createSessionCookie(), createOEPConfigCookie()]);
-    } catch (err) {
-      log.error({ method: 'set cookies', request: this.targetUrl, error: err });
-      this.emit('reset_context');
-    }
-  }
-
-  async clearCookies() {
+  async resetContext() {
     try {
       await this.context.clearCookies();
+      await this.context.addCookies([createSessionCookie(), createOEPConfigCookie()]);
     } catch (err) {
-      log.error({ method: 'clear cookies', request: this.targetUrl, error: err });
+      const error = err as Error;
+      log.error({ method: 'reset context', request: this.targetUrl, error: error.message });
       this.emit('reset_context');
     }
   }
@@ -184,26 +133,53 @@ export class Crawler extends EventEmitter {
   }
 
   async goto() {
-    if (!this.hasActiveContext) {
-      log.warn({ method: 'goto', request: this.targetUrl, message: 'context not active' });
-      return;
-    }
     try {
       const page = await this.context.newPage();
-      this.attachListeners(page);
-      await page.goto(this.targetUrl, {
-        referer,
-        waitUntil: 'domcontentloaded',
-      });
-      await page.close();
+      page.on('close', () => log.debug('page closed'));
+
+      page
+        .goto(this.targetUrl, {
+          referer,
+          waitUntil: 'domcontentloaded',
+          timeout: 3000,
+        })
+        .then((res) => this.responseHandler(res))
+        .catch((err) => {
+          const error = err as Error;
+          log.error({
+            method: 'goto page',
+            request: this.targetUrl,
+            error: err,
+            message: error.message,
+          });
+
+          if (this.retryCount < MAX_RETRIES) {
+            this.retryCount++;
+            this.emit('next_request');
+          } else if (this.isBatchMode) {
+            log.error({ msg: 'request reached max retries', url: this.targetUrl });
+            this.retryCount = 0;
+            this.emit('next_request');
+          } else {
+            this.requestError(err);
+          }
+        })
+        .finally(() => {
+          if (!page.isClosed()) {
+            page.close().catch((err) => {
+              const error = err as Error;
+              log.error({
+                method: 'close page',
+                request: this.targetUrl,
+                error: err,
+                message: error.message,
+              });
+            });
+          }
+        });
     } catch (err) {
       const error = err as Error;
       log.error({ method: 'goto', request: this.targetUrl, error: err, message: error.message });
-
-      const isClosed = /Target page, context or browser has been closed/.test(error.message);
-      if (!isClosed) {
-        this.emit('next_request');
-      }
     }
   }
 
@@ -212,6 +188,24 @@ export class Crawler extends EventEmitter {
       type: 'scan_finish',
       request_id: this.requestID,
       worker_name: process.env.WORKER_ID || '',
+    };
+    process.send?.(res);
+  }
+
+  private workerStarted() {
+    const msg: WorkerResponseMessage = {
+      type: 'worker_started',
+      worker_name: process.env.WORKER_ID || '',
+    };
+    process.send?.(msg);
+  }
+
+  private requestError(msg: string) {
+    const res: WorkerResponseMessage = {
+      type: 'scan_error',
+      request_id: this.requestID,
+      worker_name: process.env.WORKER_ID || '',
+      error: msg,
     };
     process.send?.(res);
   }
@@ -225,6 +219,58 @@ export class Crawler extends EventEmitter {
       const error = err as Error;
       log.error({ msg: 'unexpected error terminating crawler', error: error.message });
     }
+    process.exit(0);
+  }
+
+  responseHandler(res: Response | null) {
+    if (!res) return;
+
+    if (res.request().resourceType() !== 'document') return;
+
+    if (res.status() != 200 && res.status() != 407) {
+      log.error({ request: res.request().url(), response: res.status() });
+      process.exit(1); //TODO: improve handling detection
+    }
+
+    const headers = res.headers();
+
+    if (!headers['content-type']?.includes('application/json')) return;
+
+    res
+      .json()
+      .then(async (prod: PageResponse<any>) => {
+        if (prod.data.data.length > 0) {
+          await this.database.save(this.requestID, prod.data.data);
+          // .catch((err) => log.error({ msg: 'failed to persist response', error: err }));
+        }
+
+        if (prod.data.hasMore && this.isBatchMode) {
+          this.cursor += this.pageSize * this.step;
+          this.listPage += this.step;
+          this.emit('next_request');
+        } else {
+          this.requestFinished();
+        }
+
+        log.debug({
+          request: res.request().url(),
+          items: prod.data.data.length,
+          response: res.status(),
+          responseTime: res.request().timing().responseEnd - res.request().timing().requestStart,
+        });
+      })
+      .catch((err) => {
+        const error = err as Error;
+        log.error({
+          method: 'parse response',
+          request: this.targetUrl,
+          message: error.message,
+        });
+      });
+  }
+
+  resetRetryCounter() {
+    this.retryCount = 0;
   }
 }
 
@@ -237,10 +283,10 @@ process.on('message', async (msg: WorkerRequestMessage) => {
       const isBatchMode = msg.batch;
 
       try {
-        // await crawler.initContext();
-        await crawler.setCookies();
+        crawler.resetRetryCounter();
+        await crawler.resetContext();
         crawler.setScanParameters(targetUrl, step, requestID, isBatchMode);
-        await crawler.goto();
+        crawler.goto();
       } catch (err) {
         log.error({ msg: 'unexpected error starting scan', error: err });
       }
@@ -258,10 +304,9 @@ const crawler = new Crawler({
 
 crawler.on('next_request', async () => {
   try {
-    await crawler.clearCookies();
-    await crawler.setCookies();
+    await crawler.resetContext();
     crawler.updateScanParameters();
-    await crawler.goto();
+    crawler.goto();
   } catch (err) {
     log.error({ msg: 'unexpected error processing next request', error: err });
   }
@@ -284,11 +329,10 @@ process.on('uncaughtException', (err, origin) => {
 
 process.on('SIGTERM', async () => {
   await crawler.terminate();
-  process.exit(0);
 });
 
 try {
-  crawler.init();
+  await crawler.init();
 } catch (err) {
   log.error({ msg: 'unexpected error booting crawler', error: err });
 }

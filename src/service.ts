@@ -1,4 +1,5 @@
-import { initWorker, WorkerRequestMessage, WorkerResponseMessage } from './helpers/workers.js';
+import { initWorker } from './helpers/workers.js';
+import { WorkerRequestMessage, WorkerResponseMessage } from './helpers/types.js';
 import { env } from './config/env.js';
 import { extractScanParameters, replaceScanParameters } from './helpers/url.js';
 import { type ChildProcess } from 'node:child_process';
@@ -13,6 +14,7 @@ class Service extends EventEmitter {
   private idleWorkers = new Map<string, ChildProcess>();
   private ongoing = new Map<string, number>();
   private database!: RedisClient;
+  private activeWorkers = 0;
 
   constructor() {
     super();
@@ -32,15 +34,22 @@ class Service extends EventEmitter {
       const worker = initWorker(name);
 
       worker.on('exit', (code, signal) => {
-        // TODO: handle exit abnormal processes
-        log.warn({ 'worker finished': name, code: code });
+        if (code != 0) {
+          log.warn({ 'worker down': name, code: code });
+        } else {
+          log.info({ 'worker finished': name, code: code });
+        }
+        this.activeWorkers--;
       });
 
       worker.on('error', (err) => log.error(err));
 
-      worker.on('message', (msg: WorkerResponseMessage) => {
-        const w = this.busyWorkers.get(msg.worker_name);
-        if (!w) return;
+      worker.on('message', async (msg: WorkerResponseMessage) => {
+        let w = this.busyWorkers.get(msg.worker_name);
+        if (!w) {
+          w = this.idleWorkers.get(msg.worker_name);
+          if (!w) return;
+        }
         this.idleWorkers.set(msg.worker_name, w);
         this.busyWorkers.delete(msg.worker_name);
         switch (msg.type) {
@@ -51,16 +60,27 @@ class Service extends EventEmitter {
             if (request == 0) {
               this.emit('scan_finish', {
                 requestID: msg.request_id,
-                result: this.database.read(msg.request_id),
+                result: await this.database.read(msg.request_id),
               });
               this.ongoing.delete(msg.request_id);
+              this.database
+                .delete(msg.request_id)
+                .catch((err) => log.error({ msg: 'failed to remove events', error: err }));
             } else {
               this.ongoing.set(msg.request_id, request);
             }
             break;
           case 'scan_error':
             // TODO: handle error cases
-            this.emit('error', msg.error);
+            this.emit('error', {
+              requestID: msg.request_id,
+              error: msg.error,
+            });
+            break;
+          case 'worker_started':
+            log.info(`${msg.worker_name} started`);
+            this.activeWorkers++;
+            if (this.activeWorkers == env.WORKERS) this.emit('service_started');
             break;
         }
       });
@@ -126,7 +146,12 @@ class Service extends EventEmitter {
     return this.idleWorkers.size > 0;
   }
 
+  operationalWorks(): number {
+    return this.activeWorkers;
+  }
+
   async shutdown() {
+    await this.database.disconnect();
     for (const [name, worker] of this.idleWorkers) {
       worker.kill();
       this.idleWorkers.delete(name);
@@ -135,7 +160,6 @@ class Service extends EventEmitter {
       worker.kill();
       this.idleWorkers.delete(name);
     }
-    await this.database.disconnect();
   }
 }
 

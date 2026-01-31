@@ -1,4 +1,5 @@
 import { App } from './src/app.js';
+import service from './src/service.js';
 
 const app = new App();
 
@@ -11,4 +12,6 @@ process.on('uncaughtException', (err, origin) => {
   process.exit(10);
 });
 
-app.start();
+service.once('service_started', () => {
+  app.start();
+});

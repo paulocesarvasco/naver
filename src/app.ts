@@ -15,7 +15,6 @@ export class App {
   async start(): Promise<void> {
     try {
       await this.server.listen({ port: env.SERVER_PORT, host: env.SERVER_HOST });
-      this.server.log.info('server listening');
     } catch (err) {
       this.server.log.error(err, 'failed to start server');
       process.exitCode = 1;
