@@ -1,5 +1,5 @@
 import { initWorker } from './helpers/workers.js';
-import { WorkerRequestMessage, WorkerResponseMessage } from './helpers/types.js';
+import { RequestInfo, WorkerRequestMessage, WorkerResponseMessage } from './helpers/types.js';
 import { env } from './config/env.js';
 import { extractScanParameters, replaceScanParameters } from './helpers/url.js';
 import { type ChildProcess } from 'node:child_process';
@@ -12,7 +12,7 @@ const log = createLogger();
 class Service extends EventEmitter {
   private busyWorkers = new Map<string, ChildProcess>();
   private idleWorkers = new Map<string, ChildProcess>();
-  private ongoing = new Map<string, number>();
+  private ongoing = new Map<string, RequestInfo>();
   private database!: RedisClient;
   private activeWorkers = 0;
 
@@ -39,25 +39,20 @@ class Service extends EventEmitter {
         } else {
           log.info({ 'worker finished': name, code: code });
         }
+        this.busyWorkers.delete(name);
+        this.idleWorkers.delete(name);
         this.activeWorkers--;
       });
 
       worker.on('error', (err) => log.error(err));
 
       worker.on('message', async (msg: WorkerResponseMessage) => {
-        let w = this.busyWorkers.get(msg.worker_name);
-        if (!w) {
-          w = this.idleWorkers.get(msg.worker_name);
-          if (!w) return;
-        }
-        this.idleWorkers.set(msg.worker_name, w);
-        this.busyWorkers.delete(msg.worker_name);
         switch (msg.type) {
           case 'scan_finish':
-            let request = this.ongoing.get(msg.request_id);
-            if (!request) return;
-            request--;
-            if (request == 0) {
+            let requestInfo = this.ongoing.get(msg.request_id);
+            if (!requestInfo) return;
+            requestInfo.ongoingRequests--;
+            if (requestInfo.ongoingRequests == 0) {
               this.emit('scan_finish', {
                 requestID: msg.request_id,
                 result: await this.database.read(msg.request_id),
@@ -66,16 +61,28 @@ class Service extends EventEmitter {
               this.database
                 .delete(msg.request_id)
                 .catch((err) => log.error({ msg: 'failed to remove events', error: err }));
+              this.swapWorkerState(msg.worker_name);
             } else {
-              this.ongoing.set(msg.request_id, request);
+              this.ongoing.set(msg.request_id, requestInfo);
             }
             break;
           case 'scan_error':
-            // TODO: handle error cases
-            this.emit('error', {
-              requestID: msg.request_id,
-              error: msg.error,
-            });
+            requestInfo = this.ongoing.get(msg.request_id);
+            if (!requestInfo) return;
+            requestInfo.ongoingRequests--;
+            if (requestInfo.ongoingRequests == 0) {
+              this.emit('error', {
+                requestID: msg.request_id,
+                error: msg.error,
+              });
+              this.ongoing.delete(msg.request_id);
+              this.database
+                .delete(msg.request_id)
+                .catch((err) => log.error({ msg: 'failed to remove events', error: err }));
+              this.swapWorkerState(msg.worker_name);
+            } else {
+              this.ongoing.set(msg.request_id, requestInfo);
+            }
             break;
           case 'worker_started':
             log.info(`${msg.worker_name} started`);
@@ -98,8 +105,7 @@ class Service extends EventEmitter {
       if (!workerEntry) return;
 
       const [name, worker] = workerEntry;
-      this.idleWorkers.delete(name);
-      this.busyWorkers.set(name, worker);
+      this.swapWorkerState(name);
 
       const scanParameters = extractScanParameters(url);
       const cursor = scanParameters.cursor + scanParameters.pageSize * offset;
@@ -113,8 +119,18 @@ class Service extends EventEmitter {
         batch: true,
       };
 
-      let request = this.ongoing.get(requestID);
-      request ? this.ongoing.set(requestID, ++request) : this.ongoing.set(requestID, 1);
+      let requestInfo = this.ongoing.get(requestID);
+      if (requestInfo) {
+        requestInfo.workers.push(name);
+        requestInfo.ongoingRequests++;
+        this.ongoing.set(requestID, requestInfo);
+      } else {
+        const requestInfo: RequestInfo = {
+          workers: [name],
+          ongoingRequests: 1,
+        };
+        this.ongoing.set(requestID, requestInfo);
+      }
 
       worker.send(msg);
       offset++;
@@ -126,8 +142,7 @@ class Service extends EventEmitter {
     if (!workerEntry) return;
 
     const [name, worker] = workerEntry;
-    this.idleWorkers.delete(name);
-    this.busyWorkers.set(name, worker);
+    this.swapWorkerState(name);
 
     const msg: WorkerRequestMessage = {
       type: 'scan',
@@ -136,10 +151,14 @@ class Service extends EventEmitter {
       step: 1,
       batch: false,
     };
-    worker.send(msg);
 
-    let request = this.ongoing.get(requestID);
-    request ? log.error('request not registered') : this.ongoing.set(requestID, 1);
+    const requestInfo: RequestInfo = {
+      workers: [name],
+      ongoingRequests: 1,
+    };
+    this.ongoing.set(requestID, requestInfo);
+
+    worker.send(msg);
   }
 
   isAvailable(): boolean {
@@ -159,6 +178,41 @@ class Service extends EventEmitter {
     for (const [name, worker] of this.busyWorkers) {
       worker.kill();
       this.idleWorkers.delete(name);
+    }
+  }
+
+  cancelRequest(requestID: string) {
+    const requestInfo = this.ongoing.get(requestID);
+    if (!requestInfo) {
+      log.warn({ msg: 'request not found', request_id: requestID });
+      return;
+    }
+
+    requestInfo.workers.forEach((workerName) => {
+      const worker = this.busyWorkers.get(workerName);
+      if (!worker) {
+        log.warn({ msg: 'worker not active', worker: workerName });
+        return;
+      }
+      worker.send(<WorkerRequestMessage>{ type: 'cancel' });
+      this.swapWorkerState(workerName);
+    });
+    this.ongoing.delete(requestID);
+  }
+
+  private swapWorkerState(workerName: string) {
+    let worker = this.busyWorkers.get(workerName);
+    if (worker) {
+      this.busyWorkers.delete(workerName);
+      this.idleWorkers.set(workerName, worker);
+    } else {
+      worker = this.idleWorkers.get(workerName);
+      if (!worker) {
+        log.warn({ msg: 'worker not found', name: workerName });
+        return;
+      }
+      this.idleWorkers.delete(workerName);
+      this.busyWorkers.set(workerName, worker);
     }
   }
 }

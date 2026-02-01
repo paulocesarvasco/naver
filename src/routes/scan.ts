@@ -29,6 +29,13 @@ export const scan: FastifyPluginAsync = async (app) => {
       try {
         const requestID = crypto.randomUUID();
 
+        request.raw.on('close', () => {
+          if (request.raw.aborted) {
+            request.log.warn('connection aborted');
+            service.cancelRequest(requestID);
+          }
+        });
+
         const response = waitForEvent<ResponsePayload>(service, 'scan_finish', {
           filter: (payload) => payload.requestID === requestID,
         });
@@ -71,9 +78,17 @@ export const nave: FastifyPluginAsync = async (app) => {
     handler: async (request, reply) => {
       const { url } = request.query as { url: string };
 
+      const requestID = crypto.randomUUID();
+
+      request.raw.on('close', () => {
+        if (request.raw.aborted) {
+          request.log.warn('connection aborted');
+          service.cancelRequest(requestID);
+        }
+      });
+
       try {
         const result = await requestQueue.push(async () => {
-          const requestID = crypto.randomUUID();
           const response = waitForEvent<ResponsePayload>(service, 'scan_finish', {
             filter: (payload) => payload.requestID === requestID,
           });

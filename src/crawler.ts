@@ -61,11 +61,6 @@ export class Crawler extends EventEmitter {
       await this.initContext();
       await this.database.connect();
 
-      const page = await this.context.newPage();
-      await page.goto(referer, {
-        waitUntil: 'commit',
-      });
-      await page.close();
       this.workerStarted();
     } catch (err) {
       log.error({ msg: 'crawler init failed', error: err });
@@ -80,6 +75,9 @@ export class Crawler extends EventEmitter {
 
     if (this.context) {
       try {
+        for (const page of this.context.pages()) {
+          await page.close();
+        }
         await this.context.close();
       } catch (err) {
         log.warn({ err }, 'failed to close previous context');
@@ -95,8 +93,14 @@ export class Crawler extends EventEmitter {
       this.context.on('close', () => {
         log.info('context closed');
       });
+
+      const page = await this.context.newPage();
+      await page.goto(referer, {
+        waitUntil: 'commit',
+      });
+      await page.close();
     } catch (err) {
-      log.error({ msg: 'failed to close previous context', error: err });
+      log.error({ msg: 'failed to create context', error: err });
     }
   }
 
@@ -275,21 +279,29 @@ export class Crawler extends EventEmitter {
 }
 
 process.on('message', async (msg: WorkerRequestMessage) => {
-  switch (msg.type) {
-    case 'scan':
-      const targetUrl = msg.url;
-      const step = msg.step;
-      const requestID = msg.request_id;
-      const isBatchMode = msg.batch;
+  try {
+    switch (msg.type) {
+      case 'scan':
+        const targetUrl = msg.url;
+        const step = msg.step;
+        const requestID = msg.request_id;
+        const isBatchMode = msg.batch;
 
-      try {
         crawler.resetRetryCounter();
         await crawler.resetContext();
         crawler.setScanParameters(targetUrl, step, requestID, isBatchMode);
         crawler.goto();
-      } catch (err) {
-        log.error({ msg: 'unexpected error starting scan', error: err });
-      }
+        break;
+      case 'cancel':
+        await crawler.initContext();
+        break;
+    }
+  } catch (err) {
+    log.error({
+      msg: 'unexpected error processing crawler message',
+      received_msg: msg,
+      error: err,
+    });
   }
 });
 

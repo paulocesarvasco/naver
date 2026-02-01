@@ -14,9 +14,15 @@ export type PageResponse<T> = {
 
 export type WorkerRequestMessage =
   | { type: 'scan'; request_id: string; url: string; step: number; batch: boolean }
-  | { type: 'shutdown' };
+  | { type: 'shutdown' }
+  | { type: 'cancel' };
 
 export type WorkerResponseMessage =
   | { type: 'scan_finish'; request_id: string; worker_name: string }
   | { type: 'scan_error'; request_id: string; error: string; worker_name: string }
   | { type: 'worker_started'; worker_name: string };
+
+export type RequestInfo = {
+  workers: string[];
+  ongoingRequests: number;
+};
