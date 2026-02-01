@@ -1,4 +1,4 @@
-import { firefox, Browser, BrowserContext, Response, errors } from 'playwright';
+import { firefox, Browser, BrowserContext, Response } from 'playwright';
 import { createOEPConfigCookie, createSessionCookie } from './helpers/cookies.js';
 import { env } from './config/env.js';
 import { extractScanParameters, replaceScanParameters } from './helpers/url.js';
@@ -33,6 +33,7 @@ export class Crawler extends EventEmitter {
   private database!: RedisClient;
   private isBatchMode!: boolean;
   private retryCount!: number;
+  private isRunning!: boolean;
 
   constructor(
     private readonly options: {
@@ -60,7 +61,7 @@ export class Crawler extends EventEmitter {
       this.browser.on('disconnected', () => log.info('browser disconnected'));
       await this.initContext();
       await this.database.connect();
-
+      this.enableCrawler();
       this.workerStarted();
     } catch (err) {
       log.error({ msg: 'crawler init failed', error: err });
@@ -273,8 +274,17 @@ export class Crawler extends EventEmitter {
       });
   }
 
-  resetRetryCounter() {
+  enableCrawler() {
     this.retryCount = 0;
+    this.isRunning = true;
+  }
+
+  disableCrawler() {
+    this.isRunning = false;
+  }
+
+  isEnabled() {
+    return this.isRunning;
   }
 }
 
@@ -287,12 +297,13 @@ process.on('message', async (msg: WorkerRequestMessage) => {
         const requestID = msg.request_id;
         const isBatchMode = msg.batch;
 
-        crawler.resetRetryCounter();
+        crawler.enableCrawler();
         await crawler.resetContext();
         crawler.setScanParameters(targetUrl, step, requestID, isBatchMode);
         crawler.goto();
         break;
       case 'cancel':
+        crawler.disableCrawler();
         await crawler.initContext();
         break;
     }
@@ -316,6 +327,7 @@ const crawler = new Crawler({
 
 crawler.on('next_request', async () => {
   try {
+    if (!crawler.isEnabled()) return;
     await crawler.resetContext();
     crawler.updateScanParameters();
     crawler.goto();

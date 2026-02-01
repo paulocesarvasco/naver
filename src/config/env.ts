@@ -20,6 +20,7 @@ export const env = {
   WORKERS: Number(required('WORKERS')),
   SERVER_PORT: Number(required('SERVER_PORT')),
   SERVER_HOST: required('SERVER_HOST'),
+  SERVER_TIMEOUT: Number(required('SERVER_TIMEOUT')),
   DB_PORT: Number(required('DB_PORT')),
   DB_HOST: required('DB_HOST'),
 };

@@ -1,8 +1,9 @@
 import type { FastifyPluginAsync } from 'fastify';
 import service from '../service.js';
-import { waitForEvent } from '../helpers/events.js';
+import { TimeoutError, waitForEvent } from '../helpers/events.js';
 import requestQueue from '../helpers/queue.js';
 import { type ResponsePayload } from '../helpers/types.js';
+import { env } from '../config/env.js';
 
 export const scan: FastifyPluginAsync = async (app) => {
   app.route({
@@ -70,11 +71,6 @@ export const nave: FastifyPluginAsync = async (app) => {
         },
       },
     },
-    // preHandler: async (request, reply) => {
-    //   if (!service.isAvailable()) {
-    //     return reply.code(422).send({ error: 'too_many_requests' });
-    //   }
-    // },
     handler: async (request, reply) => {
       const { url } = request.query as { url: string };
 
@@ -91,6 +87,7 @@ export const nave: FastifyPluginAsync = async (app) => {
         const result = await requestQueue.push(async () => {
           const response = waitForEvent<ResponsePayload>(service, 'scan_finish', {
             filter: (payload) => payload.requestID === requestID,
+            timeout: env.SERVER_TIMEOUT,
           });
           service.scanSinglePage(url, requestID);
           return await response;
@@ -98,6 +95,9 @@ export const nave: FastifyPluginAsync = async (app) => {
 
         return result.result;
       } catch (err) {
+        if (err instanceof TimeoutError) {
+          return reply.code(408).send({ error: 'timeout' });
+        }
         request.log.error({ err, url }, 'scan failed');
         return reply.code(500).send({ error: 'scan_failed' });
       }

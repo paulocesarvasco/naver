@@ -67,10 +67,10 @@ class Service extends EventEmitter {
             }
             break;
           case 'scan_error':
-            requestInfo = this.ongoing.get(msg.request_id);
-            if (!requestInfo) return;
-            requestInfo.ongoingRequests--;
-            if (requestInfo.ongoingRequests == 0) {
+            let requestErrorInfo = this.ongoing.get(msg.request_id);
+            if (!requestErrorInfo) return;
+            requestErrorInfo.ongoingRequests--;
+            if (requestErrorInfo.ongoingRequests == 0) {
               this.emit('error', {
                 requestID: msg.request_id,
                 error: msg.error,
@@ -81,7 +81,7 @@ class Service extends EventEmitter {
                 .catch((err) => log.error({ msg: 'failed to remove events', error: err }));
               this.swapWorkerState(msg.worker_name);
             } else {
-              this.ongoing.set(msg.request_id, requestInfo);
+              this.ongoing.set(msg.request_id, requestErrorInfo);
             }
             break;
           case 'worker_started':
