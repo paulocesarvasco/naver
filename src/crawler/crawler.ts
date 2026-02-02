@@ -96,7 +96,11 @@ export class Crawler extends EventEmitter {
     } catch (err) {
       const error = err as Error;
       log.error({ msg: 'failed to create context', error: error.message });
-      await this.initContext();
+      if (this.retryCount < MAX_RETRIES) {
+        this.initContext();
+      } else {
+        process.exit(1);
+      }
     }
   }
 

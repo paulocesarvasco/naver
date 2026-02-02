@@ -98,6 +98,7 @@ export const nave: FastifyPluginAsync = async (app) => {
         return result.result;
       } catch (err) {
         if (err instanceof TimeoutError) {
+          service.cancelRequest(requestID);
           return reply.code(408).send({ error: 'timeout' });
         }
         request.log.error({ err, url }, 'scan failed');
