@@ -1,14 +1,5 @@
-type WaitForEventOptions<T> = {
-  timeout?: number;
-  filter: (value: T) => boolean;
-};
-
-export class TimeoutError extends Error {
-  public readonly name = 'TimeoutError';
-  constructor() {
-    super();
-  }
-}
+import { WaitForEventOptions } from '../types/types.js';
+import { TimeoutError } from './errors.js';
 
 export function waitForEvent<T>(
   emitter: NodeJS.EventEmitter,

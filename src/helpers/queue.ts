@@ -1,12 +1,5 @@
-import { env } from '../config/env.js';
 import service from '../service.js';
-import { type ResponsePayload } from './types.js';
-
-type Task<T> = {
-  run: () => Promise<T>;
-  resolve: (v: T) => void;
-  reject: (e: unknown) => void;
-};
+import type { ResponsePayload, Task } from '../types/types.js';
 
 export class AwaitQueue<T> {
   private running = 0;
@@ -19,13 +12,13 @@ export class AwaitQueue<T> {
   push(run: () => Promise<T>): Promise<T> {
     return new Promise<T>((resolve, reject) => {
       this.q.push({ run, resolve, reject });
-      this.pump();
+      this.pop();
     });
   }
 
-  private pump() {
+  private pop() {
     while (
-      this.running <= service.operationalWorks() &&
+      this.running <= service.operationalWorkers() &&
       service.isAvailable() &&
       this.q.length > 0
     ) {
@@ -37,7 +30,7 @@ export class AwaitQueue<T> {
         .catch(t.reject)
         .finally(() => {
           this.running--;
-          this.pump();
+          this.pop();
         });
     }
   }

@@ -1,5 +1,5 @@
-import { initWorker } from './helpers/workers.js';
-import { RequestInfo, WorkerRequestMessage, WorkerResponseMessage } from './helpers/types.js';
+import { initWorker } from './/crawler/workers.js';
+import { RequestInfo, WorkerRequestMessage, WorkerResponseMessage } from './types/types.js';
 import { env } from './config/env.js';
 import { extractScanParameters, replaceScanParameters } from './helpers/url.js';
 import { type ChildProcess } from 'node:child_process';
@@ -47,9 +47,10 @@ class Service extends EventEmitter {
       worker.on('error', (err) => log.error(err));
 
       worker.on('message', async (msg: WorkerResponseMessage) => {
+        let requestInfo: RequestInfo | undefined;
         switch (msg.type) {
           case 'scan_finish':
-            let requestInfo = this.ongoing.get(msg.request_id);
+            requestInfo = this.ongoing.get(msg.request_id);
             if (!requestInfo) return;
             requestInfo.ongoingRequests--;
             if (requestInfo.ongoingRequests == 0) {
@@ -61,16 +62,16 @@ class Service extends EventEmitter {
               this.database
                 .delete(msg.request_id)
                 .catch((err) => log.error({ msg: 'failed to remove events', error: err }));
-              this.swapWorkerState(msg.worker_name);
+              requestInfo.workers.forEach((worker) => this.swapWorkerState(worker));
             } else {
               this.ongoing.set(msg.request_id, requestInfo);
             }
             break;
           case 'scan_error':
-            let requestErrorInfo = this.ongoing.get(msg.request_id);
-            if (!requestErrorInfo) return;
-            requestErrorInfo.ongoingRequests--;
-            if (requestErrorInfo.ongoingRequests == 0) {
+            requestInfo = this.ongoing.get(msg.request_id);
+            if (!requestInfo) return;
+            requestInfo.ongoingRequests--;
+            if (requestInfo.ongoingRequests == 0) {
               this.emit('error', {
                 requestID: msg.request_id,
                 error: msg.error,
@@ -81,7 +82,7 @@ class Service extends EventEmitter {
                 .catch((err) => log.error({ msg: 'failed to remove events', error: err }));
               this.swapWorkerState(msg.worker_name);
             } else {
-              this.ongoing.set(msg.request_id, requestErrorInfo);
+              this.ongoing.set(msg.request_id, requestInfo);
             }
             break;
           case 'worker_started':
@@ -165,7 +166,7 @@ class Service extends EventEmitter {
     return this.idleWorkers.size > 0;
   }
 
-  operationalWorks(): number {
+  operationalWorkers(): number {
     return this.activeWorkers;
   }
 

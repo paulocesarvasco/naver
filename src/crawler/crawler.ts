@@ -1,25 +1,24 @@
 import { firefox, Browser, BrowserContext, Response } from 'playwright';
-import { createOEPConfigCookie, createSessionCookie } from './helpers/cookies.js';
-import { env } from './config/env.js';
-import { extractScanParameters, replaceScanParameters } from './helpers/url.js';
+import { createOEPConfigCookie, createSessionCookie } from '../helpers/cookies.js';
+import { env } from '../config/env.js';
+import { extractScanParameters, replaceScanParameters } from '../helpers/url.js';
+import { RedisClient } from '../database/client.js';
+import { createLogger } from '../log/logger.js';
+import { delay } from '../helpers/timers.js';
+import {
+  WorkerRequestMessage,
+  WorkerResponseMessage,
+  IPInfo,
+  PageResponse,
+} from '../types/types.js';
+
 import EventEmitter from 'events';
-import { RedisClient } from './database/client.js';
-import { createLogger } from './log/logger.js';
-import { WorkerRequestMessage, WorkerResponseMessage } from './helpers/types.js';
-import { PageResponse } from './helpers/types.js';
 
 const log = createLogger();
 
 const MAX_RETRIES = 3;
-
-const referer =
+const DEFAULT_REFERER: string =
   'https://search.shopping.naver.com/ns/search?query=iphone&includedDeliveryFee=true&score=4.8%7C5';
-
-export function delay(ms: number, jitterMs: number = 0): Promise<void> {
-  const jitter = jitterMs > 0 ? Math.floor(Math.random() * jitterMs) : 0;
-
-  return new Promise((resolve) => setTimeout(resolve, ms + jitter));
-}
 
 export class Crawler extends EventEmitter {
   private browser!: Browser;
@@ -36,15 +35,9 @@ export class Crawler extends EventEmitter {
   private isRunning!: boolean;
 
   constructor(
-    private readonly options: {
-      proxy?: {
-        server: string;
-        username?: string;
-        password?: string;
-      };
+    private readonly options?: {
       locale?: string;
       userAgent?: string;
-      headless?: boolean;
     },
   ) {
     super();
@@ -54,8 +47,12 @@ export class Crawler extends EventEmitter {
   async init() {
     try {
       this.browser = await firefox.launch({
-        headless: this.options.headless ?? true,
-        proxy: this.options.proxy,
+        headless: true,
+        proxy: {
+          server: env.PROXY_ADDRESS,
+          username: env.PROXY_USER,
+          password: env.PROXY_PASS,
+        },
       });
 
       this.browser.on('disconnected', () => log.info('browser disconnected'));
@@ -87,21 +84,38 @@ export class Crawler extends EventEmitter {
 
     try {
       this.context = await this.browser.newContext({
-        locale: this.options.locale ?? 'ko-KR',
-        userAgent: this.options.userAgent,
+        locale: this.options?.locale ?? 'ko-KR',
+        userAgent: this.options?.userAgent ?? '',
       });
 
       this.context.on('close', () => {
         log.info('context closed');
       });
 
-      const page = await this.context.newPage();
-      await page.goto(referer, {
-        waitUntil: 'commit',
-      });
-      await page.close();
+      await this.createProxySession();
     } catch (err) {
-      log.error({ msg: 'failed to create context', error: err });
+      const error = err as Error;
+      log.error({ msg: 'failed to create context', error: error.message });
+      await this.initContext();
+    }
+  }
+
+  private async createProxySession() {
+    const page = await this.context.newPage();
+
+    try {
+      await page.goto('https://ipinfo.thordata.com', {
+        waitUntil: 'domcontentloaded',
+        timeout: 10000,
+      });
+
+      const data: IPInfo = await page.evaluate(() => {
+        return JSON.parse(document.body.innerText);
+      });
+
+      log.info({ msg: 'proxy connected', info: data });
+    } finally {
+      await page.close();
     }
   }
 
@@ -140,11 +154,11 @@ export class Crawler extends EventEmitter {
   async goto() {
     try {
       const page = await this.context.newPage();
-      page.on('close', () => log.debug('page closed'));
+      page.on('close', () => log.debug({ msg: 'page closed', request_id: this.requestID }));
 
       page
         .goto(this.targetUrl, {
-          referer,
+          referer: DEFAULT_REFERER,
           waitUntil: 'domcontentloaded',
           timeout: 3000,
         })
@@ -156,12 +170,14 @@ export class Crawler extends EventEmitter {
             request: this.targetUrl,
             error: err,
             message: error.message,
+            request_id: this.requestID,
           });
 
           if (this.retryCount < MAX_RETRIES) {
             this.retryCount++;
             this.emit('next_request');
           } else if (this.isBatchMode) {
+            // TODO: update query parameters
             log.error({ msg: 'request reached max retries', url: this.targetUrl });
             this.retryCount = 0;
             this.emit('next_request');
@@ -178,17 +194,79 @@ export class Crawler extends EventEmitter {
                 request: this.targetUrl,
                 error: err,
                 message: error.message,
+                request_id: this.requestID,
               });
             });
           }
         });
     } catch (err) {
       const error = err as Error;
-      log.error({ method: 'goto', request: this.targetUrl, error: err, message: error.message });
+      log.error({
+        method: 'goto',
+        request: this.targetUrl,
+        error: err,
+        message: error.message,
+        request_id: this.requestID,
+      });
     }
   }
 
+  private responseHandler(res: Response | null) {
+    if (!res) return;
+
+    if (res.request().resourceType() !== 'document') return;
+
+    if (res.status() != 200 && res.status() != 407) {
+      log.error({
+        request: res.request().url(),
+        response: res.status(),
+        request_id: this.requestID,
+      });
+
+      this.requestError(res.statusText());
+    }
+
+    const headers = res.headers();
+
+    if (!headers['content-type']?.includes('application/json')) return;
+
+    res
+      .json()
+      .then(async (prod: PageResponse) => {
+        if (prod.data.data.length > 0) {
+          await this.database.save(this.requestID, prod.data.data);
+          // .catch((err) => log.error({ msg: 'failed to persist response', error: err }));
+        }
+
+        if (prod.data.hasMore && this.isBatchMode) {
+          this.cursor += this.pageSize * this.step;
+          this.listPage += this.step;
+          this.emit('next_request');
+        } else {
+          this.requestFinished();
+        }
+
+        log.debug({
+          request: res.request().url(),
+          items: prod.data.data.length,
+          response: res.status(),
+          responseTime: res.request().timing().responseEnd - res.request().timing().requestStart,
+          request_id: this.requestID,
+        });
+      })
+      .catch((err) => {
+        const error = err as Error;
+        log.error({
+          method: 'parse response',
+          request: this.targetUrl,
+          message: error.message,
+          request_id: this.requestID,
+        });
+      });
+  }
+
   private requestFinished() {
+    this.disableCrawler();
     const res: WorkerResponseMessage = {
       type: 'scan_finish',
       request_id: this.requestID,
@@ -215,65 +293,6 @@ export class Crawler extends EventEmitter {
     process.send?.(res);
   }
 
-  async terminate() {
-    try {
-      await this.browser.close();
-      await delay(200);
-      await this.database.disconnect();
-    } catch (err) {
-      const error = err as Error;
-      log.error({ msg: 'unexpected error terminating crawler', error: error.message });
-    }
-    process.exit(0);
-  }
-
-  responseHandler(res: Response | null) {
-    if (!res) return;
-
-    if (res.request().resourceType() !== 'document') return;
-
-    if (res.status() != 200 && res.status() != 407) {
-      log.error({ request: res.request().url(), response: res.status() });
-      process.exit(1); //TODO: improve handling detection
-    }
-
-    const headers = res.headers();
-
-    if (!headers['content-type']?.includes('application/json')) return;
-
-    res
-      .json()
-      .then(async (prod: PageResponse<any>) => {
-        if (prod.data.data.length > 0) {
-          await this.database.save(this.requestID, prod.data.data);
-          // .catch((err) => log.error({ msg: 'failed to persist response', error: err }));
-        }
-
-        if (prod.data.hasMore && this.isBatchMode) {
-          this.cursor += this.pageSize * this.step;
-          this.listPage += this.step;
-          this.emit('next_request');
-        } else {
-          this.requestFinished();
-        }
-
-        log.debug({
-          request: res.request().url(),
-          items: prod.data.data.length,
-          response: res.status(),
-          responseTime: res.request().timing().responseEnd - res.request().timing().requestStart,
-        });
-      })
-      .catch((err) => {
-        const error = err as Error;
-        log.error({
-          method: 'parse response',
-          request: this.targetUrl,
-          message: error.message,
-        });
-      });
-  }
-
   enableCrawler() {
     this.retryCount = 0;
     this.isRunning = true;
@@ -285,6 +304,17 @@ export class Crawler extends EventEmitter {
 
   isEnabled() {
     return this.isRunning;
+  }
+
+  async terminate() {
+    try {
+      await this.browser.close();
+      await this.database.disconnect();
+    } catch (err) {
+      const error = err as Error;
+      log.error({ msg: 'unexpected error terminating crawler', error: error.message });
+    }
+    process.exit(0);
   }
 }
 
@@ -316,20 +346,14 @@ process.on('message', async (msg: WorkerRequestMessage) => {
   }
 });
 
-const crawler = new Crawler({
-  headless: true,
-  proxy: {
-    server: env.PROXY_ADDRESS,
-    username: env.PROXY_USER,
-    password: env.PROXY_PASS,
-  },
-});
+const crawler = new Crawler();
 
 crawler.on('next_request', async () => {
   try {
     if (!crawler.isEnabled()) return;
     await crawler.resetContext();
     crawler.updateScanParameters();
+    await delay(0, 500);
     crawler.goto();
   } catch (err) {
     log.error({ msg: 'unexpected error processing next request', error: err });
@@ -348,7 +372,7 @@ crawler.on('reset_context', async () => {
 process.on('uncaughtException', (err, origin) => {
   log.error({ 'Uncaught Exception': err });
   log.error({ 'Origin:': origin });
-  process.exit(10);
+  process.exit(2);
 });
 
 process.on('SIGTERM', async () => {

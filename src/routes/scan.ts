@@ -1,8 +1,9 @@
-import type { FastifyPluginAsync } from 'fastify';
 import service from '../service.js';
-import { TimeoutError, waitForEvent } from '../helpers/events.js';
 import requestQueue from '../helpers/queue.js';
-import { type ResponsePayload } from '../helpers/types.js';
+import { type ResponsePayload } from '../types/types.js';
+import { type FastifyPluginAsync } from 'fastify';
+import { TimeoutError } from '../helpers/errors.js';
+import { waitForEvent } from '../helpers/events.js';
 import { env } from '../config/env.js';
 
 export const scan: FastifyPluginAsync = async (app) => {
@@ -84,6 +85,7 @@ export const nave: FastifyPluginAsync = async (app) => {
       });
 
       try {
+        // for now timeouts are only detected when request is popped from queue
         const result = await requestQueue.push(async () => {
           const response = waitForEvent<ResponsePayload>(service, 'scan_finish', {
             filter: (payload) => payload.requestID === requestID,
@@ -99,7 +101,7 @@ export const nave: FastifyPluginAsync = async (app) => {
           return reply.code(408).send({ error: 'timeout' });
         }
         request.log.error({ err, url }, 'scan failed');
-        return reply.code(500).send({ error: 'scan_failed' });
+        return reply.code(500).send({ error: 'internal_error' });
       }
     },
   });
